@@ -2,45 +2,56 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/lifecycle/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract TaskManager is Ownable, ReentrancyGuard {
+contract TaskManager is Ownable, ReentrancyGuard, Pausable {
 
-    uint public maxVerifiersPerTask = 5;
-    uint public minVerifiersPerTask = 3; 
+    // USDC token contract on Polygon
+    IERC20 public immutable usdcToken;
 
-    function setVerificationLimits(uint _max, uint _min) external onlyOwner {
-        maxVerifiersPerTask = _max;
-        minVerifiersPerTask = _min;
-    }
+    // Platfrom configuration
+    uint public platformFeePercentage = 250;     //2.5% (basis points)
+    uint public constant BASIS_POINTS = 10000;
+
+    // Task Management
+    uint public taskCounter;
+
+    // DAO configuration (for disputes)
+    address public doaContract;
+
+    // Platform Treasury
+    uint public treasuryBalance;
 
 
     // Task status enum
-
     enum TaskStatus {
         OPEN,
         CLAIMED,
         SUBMITTED,
+        APPROVED,
+        DISPUTED,
         COMPLETED,
-        DISPUTED
+        PAUSED
     }
 
     //Main task structure
     struct Task {
-        uint id;
+        uint96 id;
         address creator;
         address worker;
-        string title;
-        string ipfsHash;  //Task description/requirements
-        uint bounty;
-        uint stakeRequired;
-        uint deadline;
+        uint64 deadline;
+        uint32 createdAt;
+         
+        uint128 bounty;
+        uint128 stakeRequired;
         TaskStatus status;
-        uint createdAt;
+        string ipfsHash;  // Task title and description  
     }
 
     struct Submission {
         string ipfsHash;     //work deliverables
-        uint submittedAt;
+        uint64 submittedAt;
         string description;  //brief summary
     }
 
@@ -48,66 +59,34 @@ contract TaskManager is Ownable, ReentrancyGuard {
     struct Dispute {
         uint taskId;
         address initiator;
-        string ipfsHash;   //IPFS hash of dispute details
-        uint createdAt;
+        uint64 votingDeadline;
+        uint32 createdAt;
+        uint256 votesFor;
+        uint256 votesAgainst;
         bool resolved;
+        bool workerWon;
+        string ipfsHash;   //IPFS hash of dispute details
     }
 
 
-    // Phase 1: Basic Verification 
-
-    struct TaskVerification {
-        //address[] verifiers;
-        mapping(address => bool) hasVerified;
-        mapping(address => string) feedback;    //Verifier comments
-        uint approvalCount;
-        uint rejectionCount;
-        bool isVerified;                        //Final verification status
-    }
-
-
-    struct CreatorFeedback {
-        mapping(address => uint8) verifierRating;  // Creator rates verifiers 1-5
-        bool hasRated;                             // Has creator provided feedback?
-        uint averageRating;                     // Calculated average
-    }
-
-
-
-    // Phase 2: Reputation Weighting (commented for now)
-    struct ReputationData {
-        mapping(address => uint256) verifierReputation;  // Snapshot when verified
-        uint256 totalWeightedVotes;                      // Reputation-weighted total
-        uint256 weightedApprovals;                       // Weighted approvals
-    }
-
-    // State variables
-    uint public taskCounter;
-    uint public platformFeePercentage = 250; //2.5% (basis points)
-    uint public constant BASIS_POINTS = 10000;
 
     // Storage mappings
     mapping(uint => Task) public tasks;
     mapping(uint => Submission) public submissions;
     mapping(uint => Dispute) public disputes;
-    mapping(uint => TaskVerification) public verifications;
-    mapping(uint => CreatorFeedback) public creatorFeedbacks;
-    mapping(uint => ReputationData) public reputationData;
+
+    // Anti-moonlighting enforcement
     mapping(address => bool) public hasActiveTasks;
     mapping(address => uint) public activeTaskId;
     
 
-    // User stakes - prevents spam and ensures commitment
-    mapping(address => uint) public userStakes;
+    // Worker stakes - prevents spam and ensures commitment
+    mapping(address => uint) public workerStakes;
 
-    // Treasury from penalties
-    uint public treasuryFund;
+    // Task dispute tracking
+    mapping(uint => uint) public taskToDispute;  //taskId => disputeId
+    uint public disputeCounter;
 
-
-
-    // Reviewer rating score from creator feedback
-    mapping(address => uint) public reviewerRatingReceived;  // total points received
-    mapping(address => uint) public reviewerRatingPossible;  // total possible points
 
 
     // Events for frontend integration
@@ -120,7 +99,7 @@ contract TaskManager is Ownable, ReentrancyGuard {
     event StakeDeposited(address indexed user, uint amount);
     event StakeWithdrawn(address indexed user, uint amount);
     event TaskRejected(uint indexed taskId, address indexed worker, uint stakeForfeited);
-    event ReviewRated(address indexed creator, address indexed verifier, uint8 rating, uint taskId);
+    
 
     // Custom errors - more gas efficient than require strings
     error InsufficientStake();
@@ -132,7 +111,7 @@ contract TaskManager is Ownable, ReentrancyGuard {
     error InvalidParameters();
     error HasActiveTasks(uint currentTaskId);
     error InvalidTaskStatus();
-    error AlreadyVerified();
+
 
     constructor() Ownable(msg.sender) {
         taskCounter = 0;
@@ -168,6 +147,13 @@ contract TaskManager is Ownable, ReentrancyGuard {
         emit TaskCreated(taskCounter, msg.sender, msg.value);
     }
 
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
 
     function claimTask(uint _taskId) external payable nonReentrant {
 
