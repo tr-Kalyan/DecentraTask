@@ -2,8 +2,9 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/lifecycle/Pausable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract TaskManager is Ownable, ReentrancyGuard, Pausable {
 
@@ -13,12 +14,15 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
     // Platfrom configuration
     uint public platformFeePercentage = 250;     //2.5% (basis points)
     uint public constant BASIS_POINTS = 10000;
+    uint8 public constant USDC_DECIMALS = 6;
 
     // Task Management
     uint public taskCounter;
 
+
     // DAO configuration (for disputes)
-    address public doaContract;
+    address public daoContract;
+
 
     // Platform Treasury
     uint public treasuryBalance;
@@ -35,24 +39,18 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         PAUSED
     }
 
-    //Main task structure
+
+    // Main task structure
     struct Task {
         uint96 id;
         address creator;
         address worker;
         uint64 deadline;
         uint32 createdAt;
-         
         uint128 bounty;
         uint128 stakeRequired;
         TaskStatus status;
         string ipfsHash;  // Task title and description  
-    }
-
-    struct Submission {
-        string ipfsHash;     //work deliverables
-        uint64 submittedAt;
-        string description;  //brief summary
     }
 
 
@@ -61,13 +59,12 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         address initiator;
         uint64 votingDeadline;
         uint32 createdAt;
-        uint256 votesFor;
-        uint256 votesAgainst;
+        uint votesFor;
+        uint votesAgainst;
         bool resolved;
         bool workerWon;
         string ipfsHash;   //IPFS hash of dispute details
     }
-
 
 
     // Storage mappings
@@ -75,95 +72,107 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
     mapping(uint => Submission) public submissions;
     mapping(uint => Dispute) public disputes;
 
+
     // Anti-moonlighting enforcement
     mapping(address => bool) public hasActiveTasks;
     mapping(address => uint) public activeTaskId;
-    
+
 
     // Worker stakes - prevents spam and ensures commitment
     mapping(address => uint) public workerStakes;
+
 
     // Task dispute tracking
     mapping(uint => uint) public taskToDispute;  //taskId => disputeId
     uint public disputeCounter;
 
 
-
     // Events for frontend integration
     event TaskCreated(uint indexed taskId, address indexed creator, uint bounty);
-    event TaskClaimed(uint indexed taskId, address indexed worker);
+    event TaskClaimed(uint indexed taskId, address indexed worker, uint stake);
     event TaskSubmitted(uint indexed taskId, string ipfsHash);
+    event TaskApproved(uint indexed taskId, address creator);
     event TaskCompleted(uint indexed taskId, address indexed worker, uint payout);
-    event TaskDisputed(uint indexed taskId, address indexed initiator);
-    event TaskVerified(uint indexed taskId, address indexed verifier, bool approved);
+    event DisputeCreated(uint indexed disputeId, uint indexed taskId, address indexed initiator);
+    event DisputeResolved(uint indexed disputeId, bool workerWon, uint finalPayout);
     event StakeDeposited(address indexed user, uint amount);
     event StakeWithdrawn(address indexed user, uint amount);
-    event TaskRejected(uint indexed taskId, address indexed worker, uint stakeForfeited);
+    event TaskRejected(uint indexed taskId, address indexed worker,uint reason, uint stakeForfeited);
     
 
     // Custom errors - more gas efficient than require strings
-    error InsufficientStake();
+    error InsufficientUSDCBalance();
     error TaskNotFound();
     error UnauthorizedAction();
     error TaskAlreadyClaimed();
     error TaskNotSubmitted();
+    error TaskNotApproved();
     error DeadlineExceeded();
     error InvalidParameters();
     error HasActiveTasks(uint currentTaskId);
     error InvalidTaskStatus();
+    error DisputeAlreadyExists();
+    error DisputeNotFound();
+    error VotingPeriodEnded();
+    error InsufficientAllowance();
 
 
-    constructor() Ownable(msg.sender) {
+    constructor(address _usdcToken, address _daoContract) Ownable(msg.sender) {
+        usdcToken = IERC20(_usdcToken);
+        daoContract = _daoContract;
         taskCounter = 0;
+        disputeCounter = 0;
     }
 
     function createTask(
-        string calldata _title,
         string calldata _ipfsHash,
-        uint _stakeRequired,
-        uint _deadline
-    ) external payable nonReentrant {
+        uint128 _bounty,
+        uint64 _deadline
+    ) external whenNotPaused nonReentrant {
         //Input validation
-        if (msg.value == 0) revert InvalidParameters();
+        if (_bounty == 0) revert InvalidParameters();
         if (_deadline <= block.timestamp) revert InvalidParameters();
-        if (bytes(_title).length == 0) revert InvalidParameters();
+        if (bytes(_ipfsHash).length == 0) revert InvalidParameters();
+
+        // Escrow bounty
+        usdcToken.transferFrom(msg.sender, address(this), _bounty);
 
         //Create task
         taskCounter++;
 
+        
+        uint128 stakeRequired = uint128( Math.mulDiv(_bounty, 5, 100) ); //5% of bounty
+        if(_bounty > 3000 * (10 ** USDC_DECIMALS)) {
+            stakeRequired = 300 * (10 ** USDC_DECIMALS);  //Cap stake @ $300
+        }
+
         tasks[taskCounter] = Task({
-            id:taskCounter,
+            id: uint96(taskCounter),
             creator:msg.sender,
             worker:address(0),
-            title: _title,
-            ipfsHash: _ipfsHash,
-            bounty: msg.value,
-            stakeRequired: _stakeRequired,
             deadline: _deadline,
+            createdAt: uint32(block.timestamp),
+            bounty: _bounty,
+            stakeRequired: stakeRequired,
             status: TaskStatus.OPEN,
-            createdAt: block.timestamp
+            ipfsHash: _ipfsHash,
         });
 
-        emit TaskCreated(taskCounter, msg.sender, msg.value);
+        emit TaskCreated(taskCounter, msg.sender, _bounty);
     }
 
-    function pause() external onlyOwner {
-        _pause();
-    }
+                        
 
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    function claimTask(uint _taskId) external payable nonReentrant {
+    function claimTask(uint _taskId) external whenNotPaused nonReentrant {
 
         Task storage task = tasks[_taskId];
 
-        //Validation checks
+        // Validation checks
         if (task.id == 0) revert TaskNotFound();
         if (task.status != TaskStatus.OPEN) revert TaskAlreadyClaimed();
-        if (block.timestamp > task.deadline) revert DeadlineExceeded();
-        if (msg.value < task.stakeRequired) revert InsufficientStake();
+        if (block.timestamp >= task.deadline) revert DeadlineExceeded();
+        if (usdcToken.balanceOf(msg.sender) < task.stakeRequired) revert InsufficientUSDCBalance();
+        if (usdcToken.allowance(msg.sender, address(this)) < task.stakeRequired) revert InsufficientAllowance();  // Added allowance check – Explicitly verifies USDC approval before transfer; prevents silent failures and improves error messaging.
 
         //Prevent multiple active tasks (moonlighting prevention)
         if (hasActiveTasks[msg.sender]) {
@@ -174,82 +183,48 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         task.worker = msg.sender;
         task.status = TaskStatus.CLAIMED;
 
-        // Track User's stake
-        userStakes[msg.sender] += msg.value;
+        // Escrow stake
+        usdcToken.transferFrom(msg.sender, address(this), task.stakeRequired);
+
+        // Track worker's stake
+        workerStakes[msg.sender] +=task.stakeRequired;
 
         // Mark user as having active task (CRITICAL for moonlighting prevention!)
         hasActiveTasks[msg.sender] = true;
         activeTaskId[msg.sender] = _taskId;
 
-        emit TaskClaimed(_taskId, msg.sender);
+        emit TaskClaimed(_taskId, msg.sender, task.stakeRequired);
     }
+
 
     function submitWork(
         uint _taskId,
         string calldata _ipfsHash,
         string calldata _description
-    ) external nonReentrant {
-
+    ) external whenNotPaused nonReentrant {
         Task storage task = tasks[_taskId];
 
-
-        //Validation
+        // Validation
         if (task.worker != msg.sender) revert UnauthorizedAction();
         if (task.status != TaskStatus.CLAIMED) revert InvalidTaskStatus();
-        if (block.timestamp > task.deadline) revert DeadlineExceeded();
+        if (block.timestamp >= task.deadline) revert DeadlineExceeded();
+        if (bytes(_ipfsHash).length == 0) revert InvalidParameters();
+        if (bytes(_description).length == 0 || bytes(_description).length>500) revert InvalidParameters();
 
-        //Store submissions
+        // Check for existing submission. Avoid re-submission
+        if (submissions.[_taskId].submittedAt != 0) revert InvalidParameters();
+
+        // Store submission
         submissions[_taskId] = Submission({
             ipfsHash: _ipfsHash,
-            submittedAt: block.timestamp,
+            submittedAt: uint64(block.timestamp),
             description: _description
         });
 
         // Update task status
         task.status = TaskStatus.SUBMITTED;
-    
+        
         emit TaskSubmitted(_taskId, _ipfsHash);
-        
-    }
-
-    function verifyTask(uint _taskId, bool _approved, string calldata _feedback) external nonReentrant {
-
-        Task storage task = tasks[_taskId];
-
-        //Validation
-        if (task.status != TaskStatus.SUBMITTED) revert TaskNotSubmitted();
-        if (task.worker == msg.sender || task.creator == msg.sender ) {
-            revert UnauthorizedAction();
-        }
-        if (verifications[_taskId].hasVerified[msg.sender]) {
-            revert("Already Verified");
-        }
-
-        //Record verification
-        verifications[_taskId].hasVerified[msg.sender] = true;
-        verifications[_taskId].feedback[msg.sender] = _feedback;
-
-        if (_approved) {
-            verifications[_taskId].approvalCount++;
-        }else{
-            verifications[_taskId].rejectionCount++;
-        }
-
-        emit TaskVerified(_taskId,msg.sender, _approved);
-
-        // Check if verification complete
-        _checkVerificationComplete(_taskId);
-    }
-
-    function _checkVerificationComplete(uint _taskId) internal {
-        TaskVerification storage verification = verifications[_taskId];
-        
-        if (verification.approvalCount >= minVerifiersPerTask) {
-            // Task approved - release payment
-            _completeTask(_taskId);
-        } else if (verification.rejectionCount >= minVerifiersPerTask) {
-            _rejectTask(_taskId);
-        }
     }
 
     function _completeTask(uint _taskId) internal {
@@ -354,77 +329,10 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         return submissions[_taskId];
     }
 
-    // Get verification status
-    function getVerificationStatus(uint _taskId) external view returns (
-        uint approvalCount,
-        bool isComplete,
-        bool userHasVerified
-    ) {
-        TaskVerification storage verification = verifications[_taskId];
-        return (
-            verification.approvalCount,
-            verification.approvalCount >= minVerifiersPerTask,
-            verification.hasVerified[msg.sender]
-        );
-    }
 
     // Get user's current active task (0 if none)
     function getUserActiveTask(address user) external view returns (uint) {
         return activeTaskId[user];
     }
 
-
-    function rateReviewers(uint _taskId, address[] calldata verifiers, uint8[] calldata ratings) external {
-        Task storage task = tasks[_taskId];
-
-        // Validate: only task creator can rate
-        if (task.creator != msg.sender) revert UnauthorizedAction();
-
-        // Already rated check (optional)
-        if (creatorFeedbacks[_taskId].hasRated) revert("Already rated");
-
-        // Validation
-        if (verifiers.length != ratings.length || verifiers.length == 0) revert InvalidParameters();
-
-        for (uint i = 0; i < verifiers.length; i++) {
-            address verifier = verifiers[i];
-            uint8 rating = ratings[i];
-
-            if (rating > 5) revert InvalidParameters();
-
-            // Rating for the specific task
-            creatorFeedbacks[_taskId].verifierRating[verifier] = rating;
-
-            // Global reviewer stats
-            reviewerRatingReceived[verifier] += rating;
-            reviewerRatingPossible[verifier] += 5;
-
-            // Emit event for frontend and transparency
-            emit ReviewRated(msg.sender, verifier, rating, _taskId);
-        }
-
-        creatorFeedbacks[_taskId].hasRated = true;
-    }
-
-    function getReviewerRating(address reviewer) public view returns (uint ratingPercent, uint received, uint possible) {
-        received = reviewerRatingReceived[reviewer];
-        possible = reviewerRatingPossible[reviewer];
-
-        if (possible == 0) return (0, 0, 0); // No ratings yet
-
-        ratingPercent = (received * 100) / possible;  
-        return (ratingPercent, received, possible);
-    }
-
-    function getReviewerStats(address reviewer) external view returns (
-        uint ratingPercent,
-        uint received,
-        uint possible
-    ) {
-        return getReviewerRating(reviewer);
-    }
-
-    function getCreatorRatingForTask(uint _taskId, address verifier) external view returns (uint8) {
-        return creatorFeedbacks[_taskId].verifierRating[verifier];
-    }
 }
