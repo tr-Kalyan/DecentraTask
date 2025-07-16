@@ -227,6 +227,22 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         emit TaskSubmitted(_taskId, _ipfsHash);
     }
 
+    function approveWork(uint _taskId) external whenNotPaused nonReentrant {
+        Task storage task = tasks[_taskId];
+
+        // Validation 
+        if (task.creator != msg.sender) revert UnauthorizedAction();
+        if (task.status != TaskStatus.SUBMITTED) revert TaskNotSubmitted();
+
+        // Update status 
+        task.status = TaskStatus.APPROVED;
+
+        emit TaskApproved(_taskId, msg.sender);
+
+        // Auto-complete and pay
+        _completeTask(_taskId);
+    }
+
     function _completeTask(uint _taskId) internal {
         Task storage task = tasks[_taskId];
         
@@ -247,11 +263,17 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         
         
         emit TaskCompleted(_taskId, task.worker, task.bounty);
-
     }
 
-    function _rejectTask(uint _taskId) internal {
+
+
+    function _rejectTask(uint _taskId, string calldata _reason) external whenNotPaused nonReentrant {
         Task storage task = tasks[_taskId];
+
+
+        // Validation
+        if (task.creator != msg.sender) revert UnauthorizedAction();
+        if (task.status != TaskStatus.SUBMITTED) revert TaskNotSubmitted();
 
         // Calculate 20% penalty and 80% refund
         uint totalStake = userStakes[task.worker];
@@ -277,7 +299,7 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         activeTaskId[task.worker] = 0;
         
 
-        emit TaskRejected(_taskId,task.worker,penalty);
+        emit TaskRejected(_taskId, task.worker, _reason, penalty);
 
     }
 
