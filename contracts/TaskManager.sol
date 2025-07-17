@@ -36,6 +36,7 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         APPROVED,
         DISPUTED,
         COMPLETED,
+        CANCELLED,
         PAUSED
     }
 
@@ -66,6 +67,11 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         string ipfsHash;   //IPFS hash of dispute details
     }
 
+    struct Submission {
+        string ipfsHash;     //work deliverables
+        uint64 submittedAt;
+        string description;  //brief summary
+    }
 
     // Storage mappings
     mapping(uint => Task) public tasks;
@@ -155,7 +161,7 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
             bounty: _bounty,
             stakeRequired: stakeRequired,
             status: TaskStatus.OPEN,
-            ipfsHash: _ipfsHash,
+            ipfsHash: _ipfsHash
         });
 
         emit TaskCreated(taskCounter, msg.sender, _bounty);
@@ -212,7 +218,7 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         if (bytes(_description).length == 0 || bytes(_description).length>500) revert InvalidParameters();
 
         // Check for existing submission. Avoid re-submission
-        if (submissions.[_taskId].submittedAt != 0) revert InvalidParameters();
+        if (submissions[_taskId].submittedAt != 0) revert InvalidParameters();
 
         // Store submission
         submissions[_taskId] = Submission({
@@ -253,8 +259,8 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         payable(task.worker).transfer(task.bounty);
         
         // Return stake to worker
-        uint stake = userStakes[task.worker];
-        userStakes[task.worker] = 0;
+        uint stake = workerStakes[task.worker];
+        workerStakes[task.worker] = 0;
         payable(task.worker).transfer(stake);
         
         // FREE UP WORKER for new tasks (Critical!)
@@ -276,19 +282,19 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         if (task.status != TaskStatus.SUBMITTED) revert TaskNotSubmitted();
 
         // Calculate 20% penalty and 80% refund
-        uint totalStake = userStakes[task.worker];
+        uint totalStake = workerStakes[task.worker];
         uint penalty = totalStake * 20/100;
         uint refund = totalStake - penalty;
 
         // Reset user stake
-        userStakes[task.worker] = 0;
+        workerStakes[task.worker] = 0;
 
         // Return 80% of stake to worker
         if (refund > 0){
             payable(task.worker).transfer(refund);
         }
 
-        treasuryFund +=penalty;
+        treasuryBalance +=penalty;
 
         // Return task to OPEN status 
         task.status = TaskStatus.OPEN;
@@ -303,20 +309,24 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
 
     }
 
+
     // Worker state cleanup function
     function _clearWorkerState(address worker) internal {
         hasActiveTasks[worker] = false;
         activeTaskId[worker] = 0;
     }
 
+
     // Get available tasks for claiming
     function getAvailableTasks() external view returns (uint[] memory) {
         
         // Count available tasks first
         uint availableCount = 0;
+        
         for (uint i = 1; i <= taskCounter; i++) {
             if (tasks[i].status == TaskStatus.OPEN && block.timestamp <= tasks[i].deadline) {
                 availableCount++;  
+                
             }
         }
         
@@ -334,6 +344,23 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         return availableTasks;
     }
 
+    // Creator can cancel task before claiming
+    function cancelTask(uint _taskId) external whenNotPaused nonReentrant {
+        Task storage task = tasks[_taskId];
+
+        task.status = TaskStatus.CANCELLED;
+    }
+
+
+    // Worker withdraws stake if Creator doesn't respond or Worker quits
+    function emergencyWithdraw(uint _taskId) external payable whenNotPaused nonReentrant {
+
+        Task storage task = tasks[_taskId];
+
+        // Validation
+        if (task.status != TaskStatus.CLAIMED) revert InvalidParameters();
+    }
+
     // Check if user can claim tasks
     function canUserClaimTasks(address user) external view returns (bool) {
         return !hasActiveTasks[user];
@@ -344,6 +371,7 @@ contract TaskManager is Ownable, ReentrancyGuard, Pausable {
         if (tasks[_taskId].id == 0) revert TaskNotFound();
         return tasks[_taskId];
     }
+
 
     // Get task submission details  
     function getSubmission(uint _taskId) external view returns (Submission memory) {
